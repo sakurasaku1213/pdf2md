@@ -5,10 +5,9 @@
 #   # OCR フォールバック用 – CUDA or CPU で動作
 #   # Poppler が不要な純 PyMuPDF ルート
 # ------------------------------------------------------------
-import os, sys, json, hashlib, shutil, subprocess, tempfile
-# concurrent.futures はStreamlitのシンプルなGUIでは直接使わず、ファイルごとに処理します
+import os, sys, json, hashlib, shutil, subprocess, tempfile, concurrent.futures, time
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Callable
 
 import fitz                # PyMuPDF
 import streamlit as st
@@ -33,17 +32,19 @@ def page_to_md(page: fitz.Page) -> str:
     text_dict = page.get_text("dict")
     lines = []
     for block in text_dict["blocks"]:
-        if block["type"] != 0:
+        if block["type"] != 0: # type 0 is text block
             continue
         for line in block["lines"]:
-            if not line["spans"]: # Add check for empty line spans
+            if not line["spans"]: 
                 continue
             span = line["spans"][0]
             lines.append({"size": span["size"], "text": span["text"].rstrip()})
     if not lines:
         return ""
+    
     sizes = sorted({l["size"] for l in lines}, reverse=True)
     h1_size, h2_size = sizes[0], sizes[1] if len(sizes) > 1 else sizes[0]
+    
     md_lines = []
     for l in lines:
         txt = l["text"]
@@ -59,18 +60,17 @@ def page_to_md(page: fitz.Page) -> str:
             md_lines.append(txt)
     return "\n".join(md_lines)
 
-# --------- 2. OCR フォールバック (一時ディレクトリ処理を改善) -------------
+# --------- 2. OCR フォールバック (変更なし, 一時ディレクトリ処理改善済み) -------------
 def export_pages_as_png(doc: fitz.Document,
                         indices: List[int],
                         dpi: int = 220,
                         outdir: Path = None) -> List[Path]:
     if outdir is None:
-        # Ensure the temporary directory for PNGs is created successfully
         try:
             outdir = Path(tempfile.mkdtemp(prefix="pdf2md_png_"))
         except Exception as e:
             st.error(f"PNGエクスポート用の一時ディレクトリ作成に失敗: {e}")
-            return [] # Return empty list if directory creation fails
+            return []
     else:
         outdir = Path(outdir)
     
@@ -79,7 +79,6 @@ def export_pages_as_png(doc: fitz.Document,
     except Exception as e:
         st.error(f"PNGエクスポート先のディレクトリ作成/確認に失敗 ({outdir}): {e}")
         return []
-
 
     png_paths = []
     for i in indices:
@@ -99,7 +98,6 @@ def run_yomitoku(png_paths: List[Path],
         return {}
     
     md_by_page = {}
-    # Use try-except for TemporaryDirectory context managers
     try:
         with tempfile.TemporaryDirectory(prefix="yomitoku_ocr_out_") as ocr_output_tmpdir_str, \
              tempfile.TemporaryDirectory(prefix="yomitoku_input_img_") as input_img_tmpdir_str:
@@ -108,16 +106,14 @@ def run_yomitoku(png_paths: List[Path],
             input_img_tmpdir_path = Path(input_img_tmpdir_str)
                 
             copied_png_paths_for_yomitoku = []
-            original_indices_map = {} # Maps copied filename back to original page index
+            original_indices_map = {} 
 
             for png_path in png_paths:
                 try:
-                    # Extract original page index from filename like "page_XX.png"
                     original_page_index = int(png_path.stem.split('_')[1]) - 1
                     copied_path = input_img_tmpdir_path / png_path.name
                     shutil.copy(png_path, copied_path)
                     copied_png_paths_for_yomitoku.append(copied_path)
-                    # Store mapping from the copied image's name to its original document page index
                     original_indices_map[copied_path.name] = original_page_index 
                 except (ValueError, IndexError, Exception) as e:
                     st.warning(f"OCR用画像 {png_path.name} のコピーまたはインデックス抽出に失敗: {e}")
@@ -134,7 +130,6 @@ def run_yomitoku(png_paths: List[Path],
                 "--combine", "--lite"
             ]
             try:
-                # Ensure stderr is captured and decoded properly
                 process = subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8', errors='replace')
             except subprocess.CalledProcessError as e:
                 st.error(f"YomiTokuの実行に失敗しました。コマンド: {' '.join(cmd)}")
@@ -150,15 +145,12 @@ def run_yomitoku(png_paths: List[Path],
                 return {}
                 
             md_text = md_files[0].read_text(encoding="utf-8")
-            # YomiToku combine 出力はページ区切りに '---' を使う
-            parts = [s.strip() for s in md_text.split("\\n---\\n")] # Adjusted split pattern
+            parts = [s.strip() for s in md_text.split("\\n---\\n")]
             
-            # Sort the copied PNG names to match the order of 'parts' from YomiToku's combined output
             sorted_copied_png_names = sorted([p.name for p in copied_png_paths_for_yomitoku])
 
             if len(parts) != len(sorted_copied_png_names):
-                st.warning(f"OCR結果のパーツ数({len(parts)})と画像数({len(sorted_copied_png_names)})が一致しません。処理結果が不正確になる可能性があります。")
-                # Attempt to process what we can, or return {}
+                st.warning(f"OCR結果のパーツ数({len(parts)})と画像数({len(sorted_copied_png_names)})が一致しません。")
             
             for i, text_part in enumerate(parts):
                 if i < len(sorted_copied_png_names):
@@ -169,123 +161,158 @@ def run_yomitoku(png_paths: List[Path],
                     else:
                         st.warning(f"OCR結果のファイル名 {png_filename} に対応する元のページインデックスが見つかりません。")
                 else:
-                    # More parts than images, something is wrong
                     st.warning(f"OCR結果のパーツが画像数より多いです。パーツ {i+1} は無視されます。")
                     break 
     except Exception as e:
         st.error(f"OCR処理中（一時ディレクトリ管理など）に予期せぬエラー: {e}")
-        return {} # Return empty if any critical error in temp dir handling
+        return {}
     return md_by_page
 
-# --------- 3. 単一 PDF 変換 (エラー処理と一時ディレクトリ管理を強化) --------
+# --------- 3. 単一 PDF 変換 (Concurrency and Cancellation Refactored) --------
 def pdf_to_markdown(pdf_path: Path,
                     dst_dir: Path,
-                    cache_dir: Path,
-                    device: str = "cuda",
-                    progress_bar=None,
-                    file_idx=0,
-                    total_files=1
+                    cache_dir: Path, 
+                    device: str, 
+                    filename_key: str, 
+                    update_status_callback: Callable[[str, str], None]
                     ) -> None:
-    if progress_bar:
-        progress_text = f"処理中: {pdf_path.name} ({file_idx+1}/{total_files})"
-        try:
-            progress_value = (file_idx / total_files) if total_files > 0 else 0
-            progress_bar.progress(progress_value, text=progress_text)
-        except Exception as e:
-            st.warning(f"プログレスバーの更新に失敗: {e}")
-
-
-    pdf_hash = sha256(pdf_path)
-    cache_md = cache_dir / f"{pdf_hash}.md"
-    out_md  = dst_dir / f"{pdf_path.stem}.md"
-
-    try:
-        cache_dir.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        st.warning(f"キャッシュディレクトリの作成/確認に失敗 ({cache_dir}): {e}")
-        # Continue without cache if it fails
-
-    if cache_md.exists():
-        try:
-            shutil.copy(cache_md, out_md)
-            st.info(f"キャッシュを利用しました: {pdf_path.name} -> {out_md.name}")
-            if progress_bar:
-                 new_progress = ((file_idx + 1) / total_files) if total_files > 0 else 1
-                 progress_bar.progress(new_progress, text=f"完了 (キャッシュ): {pdf_path.name} ({file_idx+1}/{total_files})")
-            return
-        except Exception as e:
-            st.warning(f"キャッシュファイルのコピーに失敗 ({cache_md} -> {out_md}): {e}。通常変換を試みます。")
-
-    doc = None
-    try:
-        doc = fitz.open(pdf_path)
-    except Exception as e:
-        st.error(f"PDFファイルを開けませんでした: {pdf_path.name} - {e}")
-        if progress_bar:
-            new_progress = ((file_idx + 1) / total_files) if total_files > 0 else 1
-            progress_bar.progress(new_progress, text=f"エラー: {pdf_path.name} ({file_idx+1}/{total_files})")
+    # Point 1: At the very beginning
+    if st.session_state.get('cancel_requested', False):
+        update_status_callback(filename_key, "Cancelled")
         return
+    
+    update_status_callback(filename_key, "Processing...")
+    doc = None 
+    png_export_temp_dir = None # Initialize for finally block
 
-    md_pages = [page_to_md(p) for p in doc] # Initial conversion from text layer
-    need_ocr_pages_indices = [i for i,p in enumerate(doc) if not has_text_layer(p)]
-
-    if need_ocr_pages_indices:
-        st.write(f"{pdf_path.name}: {len(need_ocr_pages_indices)} ページでOCRを実行します...")
-        png_export_temp_dir = None # Initialize
-        try:
-            png_export_temp_dir = Path(tempfile.mkdtemp(prefix="pdf2md_gui_png_export_"))
-            pngs  = export_pages_as_png(doc, need_ocr_pages_indices, dpi=220, outdir=png_export_temp_dir)
-            if pngs: # If any PNGs were successfully exported
-                 ocr_md_parts = run_yomitoku(pngs, device=device)
-                 for idx_in_doc, md_text_part in ocr_md_parts.items():
-                     if 0 <= idx_in_doc < len(md_pages): # Check index bounds
-                         md_pages[idx_in_doc] = md_text_part # Overwrite with OCR text
-                     else:
-                         st.warning(f"OCR結果のインデックス {idx_in_doc} がページ範囲外です ({pdf_path.name})。")
-            else:
-                st.warning(f"{pdf_path.name}: OCR対象ページの画像エクスポートに失敗、または対象画像がありませんでした。")
-        except Exception as e:
-            st.error(f"OCR処理中にエラーが発生 ({pdf_path.name}): {e}")
-        finally:
-            if png_export_temp_dir and png_export_temp_dir.exists():
-                try:
-                    shutil.rmtree(png_export_temp_dir)
-                except Exception as e:
-                    st.warning(f"PNGエクスポート用一時ディレクトリの削除に失敗 ({png_export_temp_dir}): {e}")
-            
-    final_md = "\\n\\n---\\n\\n".join(md_pages) # Page separator for final markdown
     try:
-        out_md.write_text(final_md, encoding="utf-8")
+        pdf_hash = sha256(pdf_path)
+        cache_md = cache_dir / f"{pdf_hash}.md" 
+        out_md  = dst_dir / f"{pdf_path.stem}.md"
+
         try:
-            # Attempt to save to cache even if main write succeeds
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            st.warning(f"Cache directory creation/check failed ({cache_dir}): {e}") 
+
+        if cache_md.exists():
+            try:
+                shutil.copy(cache_md, out_md)
+                update_status_callback(filename_key, f"Completed (cached) -> {out_md.name}")
+                return
+            except Exception as e:
+                update_status_callback(filename_key, f"Error: Cache copy failed ({e}), retrying conversion.")
+
+        try:
+            doc = fitz.open(pdf_path)
+        except Exception as e: 
+            update_status_callback(filename_key, f"Error: Could not open PDF - {e}")
+            return
+
+        # Point 2: Before main OCR block
+        if st.session_state.get('cancel_requested', False):
+            update_status_callback(filename_key, "Cancelled")
+            if doc: doc.close()
+            return
+
+        md_pages = [page_to_md(p) for p in doc]
+        need_ocr_pages_indices = [i for i,p in enumerate(doc) if not has_text_layer(p)]
+
+        if need_ocr_pages_indices:
+            update_status_callback(filename_key, f"OCR for {len(need_ocr_pages_indices)} pages...")
+            
+            try:
+                # Point 3: Inside OCR block, before export_pages_as_png
+                if st.session_state.get('cancel_requested', False):
+                    update_status_callback(filename_key, "Cancelled")
+                    if doc: doc.close()
+                    # No png_export_temp_dir to clean yet here
+                    return
+
+                png_export_temp_dir = Path(tempfile.mkdtemp(prefix=f"pdf2md_png_{filename_key}_"))
+                update_status_callback(filename_key, f"OCR: Exporting {len(need_ocr_pages_indices)} pages to PNG...")
+                
+                # Check again after potentially long operation (temp dir creation)
+                if st.session_state.get('cancel_requested', False):
+                    update_status_callback(filename_key, "Cancelled")
+                    if doc: doc.close()
+                    if png_export_temp_dir and png_export_temp_dir.exists(): shutil.rmtree(png_export_temp_dir, ignore_errors=True)
+                    return
+                
+                pngs  = export_pages_as_png(doc, need_ocr_pages_indices, dpi=220, outdir=png_export_temp_dir)
+
+                # Point 4: Inside OCR block, before run_yomitoku
+                if st.session_state.get('cancel_requested', False):
+                    update_status_callback(filename_key, "Cancelled")
+                    if doc: doc.close()
+                    if png_export_temp_dir and png_export_temp_dir.exists(): shutil.rmtree(png_export_temp_dir, ignore_errors=True)
+                    return
+
+                if pngs:
+                     update_status_callback(filename_key, f"OCR: Running YomiToku on {len(pngs)} image(s)...")
+                     ocr_md_parts = run_yomitoku(pngs, device=device) # This is a blocking call
+                     
+                     # Check after blocking call
+                     if st.session_state.get('cancel_requested', False):
+                        update_status_callback(filename_key, "Cancelled")
+                        # Resources cleaned in finally
+                        return
+
+                     update_status_callback(filename_key, f"OCR: Processing {len(ocr_md_parts)} text result(s) from YomiToku...")
+                     for idx_in_doc, md_text_part in ocr_md_parts.items():
+                         if 0 <= idx_in_doc < len(md_pages):
+                             md_pages[idx_in_doc] = md_text_part
+                         else:
+                             st.warning(f"OCR result index {idx_in_doc} out of bounds for {filename_key}.")
+                else:
+                    st.warning(f"{filename_key}: No images exported for OCR, or export failed.")
+            except Exception as e:
+                update_status_callback(filename_key, f"Error during OCR processing: {e}")
+            finally: # Ensures cleanup if OCR block is entered
+                if png_export_temp_dir and png_export_temp_dir.exists():
+                    try:
+                        shutil.rmtree(png_export_temp_dir)
+                    except Exception as e:
+                        st.warning(f"Failed to remove temp PNG export dir ({png_export_temp_dir}): {e}")
+        
+        # Point 5: Before out_md.write_text
+        if st.session_state.get('cancel_requested', False):
+            update_status_callback(filename_key, "Cancelled")
+            if doc: doc.close()
+            return
+
+        final_md = "\\n\\n---\\n\\n".join(md_pages)
+        
+        try:
+            out_md.write_text(final_md, encoding="utf-8")
+        except Exception as e:
+            update_status_callback(filename_key, f"Error: Failed to write Markdown file - {e}")
+            return
+
+        try: 
             cache_md.write_text(final_md, encoding="utf-8")
         except Exception as e:
-            st.warning(f"Markdownのキャッシュ保存に失敗 ({cache_md}): {e}")
-        st.success(f"変換完了: {pdf_path.name} -> {out_md.name}")
-    except Exception as e:
-        st.error(f"Markdownファイルの書き出しに失敗 ({out_md}): {e}")
-        if progress_bar:
-            new_progress = ((file_idx + 1) / total_files) if total_files > 0 else 1
-            progress_bar.progress(new_progress, text=f"エラー(書き出し失敗): {pdf_path.name} ({file_idx+1}/{total_files})")
-        # Ensure doc is closed even if write fails, if it was opened
-        if doc:
+            st.warning(f"Failed to save Markdown to cache ({cache_md}): {e}")
+
+        update_status_callback(filename_key, f"Completed -> {out_md.name}")
+
+    except Exception as e: 
+        update_status_callback(filename_key, f"Error: Unexpected failure - {e}")
+    finally:
+        if doc: 
             doc.close()
-        return
+        # Cleanup OCR temp dir if exception occurred before its specific finally block
+        if png_export_temp_dir and png_export_temp_dir.exists(): 
+            try: shutil.rmtree(png_export_temp_dir, ignore_errors=True)
+            except Exception : pass
 
-    if progress_bar:
-        new_progress = ((file_idx + 1) / total_files) if total_files > 0 else 1
-        progress_bar.progress(new_progress, text=f"完了: {pdf_path.name} ({file_idx+1}/{total_files})")
-    
-    if doc: # Close the document
-        doc.close()
 
-# --------- 4. Streamlit GUI -------------------------------------------------
+# --------- 4. Streamlit GUI (Concurrency and Cancellation Refactored) ------------------------------------
 
 def select_folder_dialog():
-    """フォルダ選択ダイアログを開き、選択されたフォルダパスを返す"""
     root = tk.Tk()
-    root.withdraw()  # Tkinterのメインウィンドウを表示しない
-    root.attributes('-topmost', True)  # ダイアログを最前面に表示
+    root.withdraw() 
+    root.attributes('-topmost', True) 
     folder_selected = filedialog.askdirectory()
     root.destroy()
     return folder_selected
@@ -299,7 +326,6 @@ uploaded_files = st.sidebar.file_uploader("PDFファイルを選択 (複数可)"
 st.sidebar.markdown("---")
 st.sidebar.subheader("またはフォルダを指定")
 
-# セッションステートでフォルダパスを管理
 if 'folder_path_for_text_input' not in st.session_state:
     st.session_state.folder_path_for_text_input = ""
 
@@ -307,22 +333,19 @@ if st.sidebar.button("フォルダを選択してパスを入力", key="select_f
     selected_path = select_folder_dialog()
     if selected_path:
         st.session_state.folder_path_for_text_input = selected_path
-    # ボタンが押されたら一度スクリプトを再実行してテキスト入力に反映させる
     st.rerun()
-
 
 folder_path_str = st.sidebar.text_input(
     "PDFが含まれるフォルダのパスを入力",
-    value=st.session_state.folder_path_for_text_input, # セッションステートから値を取得
-    help="上のボタンで選択するか、ここに直接パスを入力または貼り付けしてください。例: D:\\\\scanned_documents (サブフォルダも検索します)"
+    value=st.session_state.folder_path_for_text_input, 
+    help="上のボタンで選択するか、ここに直接パスを入力または貼り付けしてください。"
 )
 
-# --- 出力先フォルダ選択 ---
-st.sidebar.markdown("---") # 区切り線
+st.sidebar.markdown("---") 
 st.sidebar.subheader("出力先フォルダ")
 
 if 'dst_folder_path' not in st.session_state:
-    st.session_state.dst_folder_path = str(Path.home() / "Documents" / "pdf2md_output") # 初期値を設定
+    st.session_state.dst_folder_path = str(Path.home() / "Documents" / "pdf2md_output") 
 
 if st.sidebar.button("出力先フォルダを選択", key="select_dst_folder_button"):
     selected_dst_path = select_folder_dialog()
@@ -330,108 +353,240 @@ if st.sidebar.button("出力先フォルダを選択", key="select_dst_folder_bu
         st.session_state.dst_folder_path = selected_dst_path
     st.rerun()
 
-# 選択された出力先フォルダパスを表示 (編集不可)
 st.sidebar.caption(f"現在の出力先: {st.session_state.dst_folder_path}")
 
-
 device_options = ["cpu"]
-if shutil.which("nvidia-smi"): # Check if nvidia-smi (CUDA utility) is available
-    device_options.insert(0, "cuda") # Add cuda as first option if available
-device_default_index = 0 # Default to first option (cuda if available, else cpu)
+if shutil.which("nvidia-smi"): 
+    device_options.insert(0, "cuda") 
+device_default_index = 0 
 
 device = st.sidebar.selectbox("OCRデバイス", device_options, index=device_default_index) 
 
-cache_dir = Path(".mdcache_gui") # GUI-specific cache directory
+cache_dir_global = Path(".mdcache_gui") 
 
-if st.sidebar.button("変換開始", type="primary", key="start_conversion_button"):
-    pdf_paths_to_process = []
-    source_type = None
+# --- Session State Initialization for Concurrency & Cancellation ---
+if 'file_statuses' not in st.session_state: st.session_state.file_statuses = {} 
+if 'conversion_running' not in st.session_state: st.session_state.conversion_running = False
+if 'current_processing_list' not in st.session_state: st.session_state.current_processing_list = []
+if 'upload_temp_dir_session' not in st.session_state: st.session_state.upload_temp_dir_session = None
+if 'tasks_submitted_this_job' not in st.session_state: st.session_state.tasks_submitted_this_job = False
+if 'current_job_futures' not in st.session_state: st.session_state.current_job_futures = {}
+if 'error_details_list' not in st.session_state: st.session_state.error_details_list = []
+if 'cancel_requested' not in st.session_state: st.session_state.cancel_requested = False
 
-    # folder_path_str に st.session_state の最新値を代入し直す (ボタン経由の場合を考慮)
-    current_folder_path_from_input = folder_path_str
 
-    # 1. Determine the source of PDF files
-    if current_folder_path_from_input: # テキスト入力フィールドの値を使用
-        # folder_path = Path(folder_path_str) # Keep for rglob, but check with os.path.isdir
-        if os.path.isdir(current_folder_path_from_input): # Use os.path.isdir for initial validation
-            folder_path = Path(current_folder_path_from_input) # Convert to Path after validation for rglob
-            # Use rglob for recursive search and sort the results
-            pdf_paths_to_process = sorted(list(folder_path.rglob("*.pdf")))
-            if not pdf_paths_to_process:
-                st.warning(f"指定フォルダ '{current_folder_path_from_input}' (サブフォルダ含む) にPDFファイルが見つかりません。")
-                st.stop() # Use st.stop() to halt execution cleanly
-            source_type = "folder"
-            st.info(f"フォルダ '{current_folder_path_from_input}' 内のPDFを処理します ({len(pdf_paths_to_process)}件)。")
-        else:
-            st.error(f"指定されたパス '{current_folder_path_from_input}' は有効なフォルダではありません。")
-            st.stop()
-    elif uploaded_files:
-        source_type = "upload"
-        st.info(f"アップロードされた {len(uploaded_files)}個のPDFファイルを処理します。")
-    else:
-        st.sidebar.warning("PDFファイルを選択するか、フォルダパスを指定してください。")
-        st.stop()
+# --- UI Placeholders ---
+overall_progress_area = st.empty()
+status_details_area = st.container()
+cancel_button_area = st.empty() # Placeholder for cancel button
 
-    # 2. Validate destination directory
-    dst_dir_str = st.session_state.dst_folder_path # セッションステートから取得
-    if not dst_dir_str:
-        st.sidebar.error("出力先フォルダが選択されていません。") # エラーメッセージに変更
-        st.stop()
-    dst_dir = Path(dst_dir_str)
-    try:
-        dst_dir.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        st.error(f"出力先フォルダの作成に失敗: {dst_dir} - {e}")
-        st.stop()
-
-    # 3. Setup cache
-    try:
-        cache_dir.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        st.warning(f"キャッシュフォルダの作成に失敗 ({cache_dir}): {e}")
+# --- "変換開始" (Start Conversion) Button Logic ---
+if st.sidebar.button("変換開始", type="primary", key="start_conversion_concurrent_button"):
+    st.session_state.conversion_running = True
+    st.session_state.file_statuses = {} 
+    st.session_state.current_processing_list = []
+    st.session_state.tasks_submitted_this_job = False 
+    st.session_state.current_job_futures = {} 
+    st.session_state.error_details_list = [] 
+    st.session_state.cancel_requested = False # Reset cancel flag for new job
     
-    st.info(f"出力先フォルダ: {dst_dir}")
-    st.info(f"OCRデバイス: {device}")
+    if st.session_state.upload_temp_dir_session and Path(st.session_state.upload_temp_dir_session).exists():
+        try: shutil.rmtree(st.session_state.upload_temp_dir_session)
+        except Exception as e: st.warning(f"Previous temp upload directory cleanup failed: {e}")
+        st.session_state.upload_temp_dir_session = None
 
-    # 4. Process PDFs
-    progress_bar_area = st.empty() # Placeholder for the progress bar
+    local_pdf_paths_to_process = [] 
+    current_folder_path_from_ui = folder_path_str 
 
-    if source_type == "upload":
-        # Use a context manager for the temporary directory for uploads
-        with tempfile.TemporaryDirectory(prefix="pdf2md_gui_upload_") as upload_tmpdir_str:
-            upload_tmpdir_path = Path(upload_tmpdir_str)
-            temp_pdf_paths_from_upload = [] # Store paths of successfully saved temp files
-            for uploaded_file_data in uploaded_files:
-                try:
-                    temp_pdf_path = upload_tmpdir_path / uploaded_file_data.name
-                    with open(temp_pdf_path, "wb") as f:
-                        f.write(uploaded_file_data.getbuffer())
-                    temp_pdf_paths_from_upload.append(temp_pdf_path)
-                except Exception as e:
-                    st.error(f"アップロードファイル {uploaded_file_data.name} の一時保存失敗: {e}")
-            
-            if not temp_pdf_paths_from_upload: # If no files were successfully saved
-                st.error("処理対象のPDFファイルがありません（一時保存失敗）。")
-                progress_bar_area.empty() # Clear progress bar area
-                st.stop()
-            
-            pdf_paths_to_process = temp_pdf_paths_from_upload # Update the list to process
-
-    # This block will now execute for both 'folder' and 'upload' (after uploads are prepared)
-    if pdf_paths_to_process: # Ensure there are files to process
-        total_files = len(pdf_paths_to_process)
-        progress_bar = progress_bar_area.progress(0, text=f"準備中... (0/{total_files})")
-        
-        for i, pdf_path_item in enumerate(pdf_paths_to_process):
-            pdf_to_markdown(pdf_path_item, dst_dir, cache_dir, device, progress_bar, i, total_files)
-        
-        progress_bar_area.empty() # Clear progress bar after completion
-        st.balloons()
-        st.success(f"すべてのファイルの変換が完了しました！ ({total_files}件処理)")
+    if current_folder_path_from_ui:
+        if os.path.isdir(current_folder_path_from_ui):
+            folder_path = Path(current_folder_path_from_ui)
+            local_pdf_paths_to_process = sorted(list(folder_path.rglob("*.pdf")))
+            if not local_pdf_paths_to_process:
+                st.warning(f"No PDF files found in '{current_folder_path_from_ui}'.")
+                st.session_state.conversion_running = False; st.stop()
+            st.info(f"Processing PDFs from folder: {len(local_pdf_paths_to_process)} files.")
+        else:
+            st.error(f"Invalid folder path: '{current_folder_path_from_ui}'.")
+            st.session_state.conversion_running = False; st.stop()
+    elif uploaded_files:
+        st.session_state.upload_temp_dir_session = tempfile.mkdtemp(prefix="pdf2md_gui_uploads_")
+        upload_dir_path = Path(st.session_state.upload_temp_dir_session)
+        for uploaded_file_data in uploaded_files:
+            try:
+                temp_pdf_path = upload_dir_path / uploaded_file_data.name
+                with open(temp_pdf_path, "wb") as f: f.write(uploaded_file_data.getbuffer())
+                local_pdf_paths_to_process.append(temp_pdf_path)
+            except Exception as e: st.error(f"Failed to save uploaded file {uploaded_file_data.name}: {e}")
+        if not local_pdf_paths_to_process:
+            st.error("No PDF files were successfully saved from upload.")
+            st.session_state.conversion_running = False; st.stop()
+        st.info(f"Processing uploaded PDF files: {len(local_pdf_paths_to_process)} files.")
     else:
-        # This case should ideally be caught earlier, but as a fallback:
-        st.warning("処理対象のPDFファイルが見つかりませんでした。")
+        st.sidebar.warning("Please select PDF files or specify a folder path.")
+        st.session_state.conversion_running = False; st.stop()
 
+    dst_dir_str_val = st.session_state.dst_folder_path 
+    if not dst_dir_str_val:
+        st.sidebar.error("Output folder is not selected.")
+        st.session_state.conversion_running = False; st.stop()
+    dst_dir_path_val = Path(dst_dir_str_val) 
+    try: dst_dir_path_val.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        st.error(f"Failed to create output folder '{dst_dir_path_val}': {e}")
+        st.session_state.conversion_running = False; st.stop()
+
+    try: cache_dir_global.mkdir(parents=True, exist_ok=True)
+    except Exception as e: st.warning(f"Failed to create cache folder '{cache_dir_global}': {e}") 
+    
+    st.info(f"Output will be saved to: {dst_dir_path_val}")
+    st.info(f"Using OCR device: {device}")
+
+    st.session_state.current_processing_list = local_pdf_paths_to_process
+    for p_path_obj in local_pdf_paths_to_process: 
+        st.session_state.file_statuses[p_path_obj.name] = "Pending" 
+    
+    st.rerun()
+
+# --- Concurrent Processing & UI Update Logic ---
+if st.session_state.conversion_running and st.session_state.current_processing_list:
+    files_for_this_run_paths = st.session_state.current_processing_list 
+    total_files_in_job = len(files_for_this_run_paths)
+
+    # Display Cancel button
+    if cancel_button_area.button("キャンセル (Cancel Conversion)", key="cancel_button_main_area"):
+        st.session_state.cancel_requested = True
+        st.warning("Cancellation requested. Will stop after current operations complete...")
+        # Immediately mark pending files as Cancelled
+        for fname_k, status_v in st.session_state.file_statuses.items():
+            if status_v == "Pending":
+                st.session_state.file_statuses[fname_k] = "Cancelled"
+        st.rerun()
+
+    def update_status_callback_main(filename_key: str, status_message: str):
+        st.session_state.file_statuses[filename_key] = status_message
+
+    current_dst_dir_path = Path(st.session_state.dst_folder_path) 
+
+    if not st.session_state.tasks_submitted_this_job and \
+       total_files_in_job > 0 and \
+       not st.session_state.get('cancel_requested', False):
+        cpu_cores_count = os.cpu_count()
+        max_w = min(4, (cpu_cores_count if cpu_cores_count else 1) + 2)
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as executor:
+            for pdf_path_for_task in files_for_this_run_paths: 
+                if st.session_state.get('cancel_requested', False): 
+                    if st.session_state.file_statuses.get(pdf_path_for_task.name) == "Pending":
+                         st.session_state.file_statuses[pdf_path_for_task.name] = "Cancelled"
+                    continue 
+                future = executor.submit(pdf_to_markdown, 
+                                         pdf_path_for_task, current_dst_dir_path, cache_dir_global, 
+                                         device, pdf_path_for_task.name, update_status_callback_main)
+                st.session_state.current_job_futures[future] = pdf_path_for_task.name
+        st.session_state.tasks_submitted_this_job = True
+    elif st.session_state.get('cancel_requested', False) and not st.session_state.tasks_submitted_this_job:
+        # If cancel was hit before any tasks were submitted, mark all as cancelled.
+        for p_path_obj_cancel in files_for_this_run_paths:
+            if st.session_state.file_statuses.get(p_path_obj_cancel.name) == "Pending":
+                st.session_state.file_statuses[p_path_obj_cancel.name] = "Cancelled"
+
+    completed_count = 0
+    error_count = 0
+    cancelled_count = 0 
+    current_job_filenames_list = [p.name for p in files_for_this_run_paths]
+
+    for fname_key in current_job_filenames_list:
+        status = st.session_state.file_statuses.get(fname_key, "Unknown")
+        if "completed" in status.lower(): completed_count += 1
+        elif "error" in status.lower(): error_count += 1
+        elif status == "Cancelled": cancelled_count += 1
+    
+    if total_files_in_job > 0:
+        progress_fraction = (completed_count + error_count + cancelled_count) / total_files_in_job
+        overall_progress_area.progress(progress_fraction, 
+            text=f"Progress: {completed_count+error_count+cancelled_count}/{total_files_in_job} files. C:{completed_count}, E:{error_count}, X:{cancelled_count} ({int(progress_fraction*100)}%)")
+
+    with status_details_area.container():
+        st.subheader("Individual File Statuses:")
+        sorted_filenames_to_display = sorted(current_job_filenames_list)
+        num_cols_to_display = 2 
+        cols_ui = st.columns(num_cols_to_display)
+        col_idx_ui = 0
+        for filename_to_disp in sorted_filenames_to_display:
+            status_to_disp = st.session_state.file_statuses.get(filename_to_disp, "Pending")
+            with cols_ui[col_idx_ui % num_cols_to_display]:
+                if "error" in status_to_disp.lower(): st.error(f"📄 {filename_to_disp}: {status_to_disp}")
+                elif "completed" in status_to_disp.lower(): st.success(f"📄 {filename_to_disp}: {status_to_disp}")
+                elif status_to_disp == "Cancelled": st.warning(f"📄 {filename_to_disp}: {status_to_disp}")
+                elif "pending" in status_to_disp.lower(): st.caption(f"📄 {filename_to_disp}: {status_to_disp}")
+                else: st.info(f"📄 {filename_to_disp}: {status_to_disp}")
+            col_idx_ui += 1
+
+    if (completed_count + error_count + cancelled_count) == total_files_in_job and total_files_in_job > 0:
+        st.session_state.conversion_running = False 
+        cancel_button_area.empty() # Clear cancel button
+        st.session_state.error_details_list = [] 
+
+        for fname, fstatus in st.session_state.file_statuses.items():
+            if fname in current_job_filenames_list and "error" in fstatus.lower():
+                if not any(d['file'] == fname for d in st.session_state.error_details_list):
+                    st.session_state.error_details_list.append({"file": fname, "message": fstatus})
+
+        futures_dict_check = st.session_state.get('current_job_futures', {})
+        for future_obj_check, name_key_check in futures_dict_check.items():
+            if name_key_check in current_job_filenames_list: 
+                if future_obj_check.done() and future_obj_check.exception() is not None:
+                    error_msg_uncaught = f"Error: Uncaught - {future_obj_check.exception()}"
+                    if "error" not in st.session_state.file_statuses.get(name_key_check, "").lower():
+                         st.session_state.file_statuses[name_key_check] = error_msg_uncaught
+                    if not any(d['file'] == name_key_check for d in st.session_state.error_details_list):
+                        st.session_state.error_details_list.append({"file": name_key_check, "message": error_msg_uncaught})
+                    else: 
+                        for item in st.session_state.error_details_list:
+                            if item['file'] == name_key_check and "Uncaught Exception" not in item['message']:
+                                item['message'] = error_msg_uncaught; break
+        
+        final_error_tally = len(st.session_state.error_details_list)
+        # Recalculate completed based on final error tally and known cancelled
+        final_completed_tally = total_files_in_job - final_error_tally - cancelled_count 
+
+        if st.session_state.error_details_list:
+            with st.expander(f"Error Summary ({final_error_tally} file(s) failed)", expanded=True):
+                for err_info in st.session_state.error_details_list:
+                    st.error(f"File: {err_info['file']} - Details: {err_info['message']}")
+        
+        if st.session_state.get('cancel_requested', False):
+            st.warning(f"Conversion process cancelled. Processed: {final_completed_tally} completed, {final_error_tally} errors, {cancelled_count} explicitly cancelled.")
+        elif final_error_tally == 0 and final_completed_tally == total_files_in_job: # No errors, no cancellations subtracted
+            st.balloons()
+            st.success(f"All {total_files_in_job} files converted successfully!")
+        else: # Handles cases with errors, or completed with some errors and no explicit cancel
+             st.info(f"Conversion finished. Results: {final_completed_tally} completed, {final_error_tally} errors, {cancelled_count} cancelled.")
+        
+        if st.session_state.upload_temp_dir_session and Path(st.session_state.upload_temp_dir_session).exists():
+            try: shutil.rmtree(st.session_state.upload_temp_dir_session)
+            except Exception as e: st.warning(f"Failed to clean up temporary upload directory: {e}")
+            st.session_state.upload_temp_dir_session = None
+        
+        st.session_state.current_job_futures = {} 
+
+    elif st.session_state.conversion_running : 
+        time.sleep(1.0) 
+        st.rerun() 
+
+if not st.session_state.conversion_running and st.session_state.file_statuses:
+    if st.button("Clear Previous Results"):
+        st.session_state.file_statuses = {}
+        st.session_state.current_processing_list = []
+        st.session_state.current_job_futures = {}
+        st.session_state.tasks_submitted_this_job = False
+        st.session_state.error_details_list = []
+        st.session_state.cancel_requested = False
+        overall_progress_area.empty() 
+        status_details_area.empty() 
+        cancel_button_area.empty()
+        st.rerun()
 
 st.markdown("---")
 st.markdown("""
@@ -440,9 +595,6 @@ st.markdown("""
     （フォルダパスを指定した場合、アップロードされたファイルは無視されます。）
 2.  Markdownファイルの出力先フォルダを指定します（存在しない場合は作成されます）。
 3.  OCRに使用するデバイスを選択します（CUDA対応GPUがあれば `cuda` を、なければ `cpu` を選択）。
-4.  「変換開始」ボタンを押すと、処理が始まります。
+4.  「変換開始」ボタンを押すと、処理が始まります。処理中は進捗が表示されます。
+5.  処理中に「キャンセル」ボタンを押すと、新規タスクの開始を停止し、現在進行中のタスク完了後に処理を終えます。
 """)
-
-# To run this script: streamlit run your_script_name.py
-# Ensure Typer related app.run() or similar is removed if this was converted from a Typer CLI.
-# The main execution flow is now handled by Streamlit's rendering of the script from top to bottom.
